@@ -24,6 +24,8 @@ jobs:
       - name: Agent client (oma.sh) against a mock desk
         id: client
         run: bash tests/test_oma.sh
+      - name: Merge recovery across runner restarts
+        run: python3 -I tests/test_merge_recovery.py
       - name: Type check and build (Cloudflare Workers, vinext)
         id: build
         run: node scripts/build_statements.mjs && node scripts/build_data.mjs && npx tsc --noEmit && npx vite build

@@ -63,6 +63,8 @@ fi
 touch "$ROOT/queue.tsv"
 SLOTS=${SLOTS:-4}; BATCH=${BATCH:-40}; declare -A SPID; LAST_REFRESH=0; LAST_OLD=0; OLDJOBS=1; LAST_CREDIT=0; REQ_SHA=""; LAST_PENDING=0; CPID=""
 iso() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
+source "$ROOT/base/tools/merge_recovery.sh"
+LAST_RECOVERY=0
 JQ_RUN='[.id, .head_sha, .run_attempt, .html_url, .updated_at, (.conclusion // ""), (.display_title // "")] | @tsv'
 remaining() { gh api rate_limit --jq '"\(.resources.core.remaining) \(.resources.core.reset)"' 2>/dev/null || echo "999 0"; }
 budget() {  # never let the repository run dry: other jobs (checks, deploys) need the API too; GraphQL is checked too
@@ -121,8 +123,15 @@ verdict() {  # $1 run id, $2 head sha, $3 attempt, $4 url, $5 old (1/0), $6 slot
     echo "$ID" >> "$ROOT/watch.txt"; rm -f "$ROOT/done/$ID.$ATT"; return 0
   fi
   PR=$(head -c 12 "$W/artifact/pr.txt" 2>/dev/null | tr -cd '0-9'); [ -n "$PR" ] || return 0
+  if [[ "$MODE" == remerge:* ]]; then
+    # Older checks use the problem title. The artifact must tie the result to this PR.
+    if [ "$PR" != "${MODE#remerge:}" ] || ! jq -e '.verdict == "accepted"' "$W/artifact/verdict.json" >/dev/null; then
+      echo "merger: recovery candidate $ID has no accepted verdict for PR #${MODE#remerge:}" >&2
+      return 0
+    fi
+  fi
   local RM; RM=$(cat "$ROOT/remerge/$PR" 2>/dev/null || echo 0)
-  [ "$MODE" = remerge ] && [ "$RM" = 0 ] && RM=1               # requeued: accepted and reported before, merge again
+  if [[ "$MODE" == remerge || "$MODE" == remerge:* ]] && [ "$RM" = 0 ]; then RM=1; fi
   if [ "$OLD" = 1 ] && gh api "repos/$REPO/issues/$PR/comments?per_page=100" --jq '.[].body' 2>/dev/null | grep -qF "$URL"; then
     # already reported (by an earlier merger): a rejection stays reported; an accepted proof still open was not merged
     # (a refused merge whose retries were lost in a restart): merge it now without repeating the verdict
@@ -131,7 +140,15 @@ verdict() {  # $1 run id, $2 head sha, $3 attempt, $4 url, $5 old (1/0), $6 slot
   fi
   ( cd "$W" && RELINT="$W/relint.json" RUN_ID="$ID" RUN_ATTEMPT="$ATT" HEAD_SHA="$SHA" RUN_URL="$URL" REMERGE="$RM" \
       timeout 900 bash "$B/tools/verdict_one.sh" ) > "$W/log.txt" 2>&1
-  echo "#$PR run $ID.$ATT: exit $? $(grep -m1 -oiE 'rate limit|ACCEPTED|REJECTED|FAULT|already on main' "$W/log.txt" || true)"
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    rm -f "$ROOT/done/$ID.$ATT"
+    echo "$ID" >> "$ROOT/watch.txt"
+  fi
+  echo "#$PR run $ID.$ATT: exit $status $(grep -m1 -oiE 'rate limit|ACCEPTED|REJECTED|FAULT|already on main' "$W/log.txt" || true)"
+  if [ -e "$W/merge-persistence-failed.flag" ]; then
+    echo "::error title=Merge retry could not be persisted::PR #$PR did not merge and its retry label could not be written. Check the PR before this runner stops."
+  fi
   grep -qE 'REJECTED|already on main' "$W/log.txt" && echo "$PR" >> "$ROOT/rejected.txt"
   [ -e "$W/rerun.flag" ] && echo "$ID" >> "$ROOT/watch.txt"   # a fault re-runs the check: same run id, next attempt
   if [ -e "$W/remerge.flag" ]; then                               # merge refused: try the same verdict again later
@@ -181,14 +198,23 @@ while [ "$(date -u +%s)" -lt "$END" ]; do
     echo "merger: requeued $(grep -vc '^#' base/tools/requeue.tsv) runs"
   fi
   # 5. the queue: new candidates join what is left from earlier loops; oldest pull request first; at most BATCH now
-  cat queue.tsv cand.tsv | awk -F'\t' 'NF >= 6 && !seen[$1]++' > all.tsv
+  : > recover.tsv
+  if [ $(( NOW - LAST_RECOVERY )) -ge 600 ]; then
+    LAST_RECOVERY=$NOW
+    discover_merge_retries "$JQ_RUN" > recover.tsv || echo "merger: could not read pending merge labels" >&2
+  fi
+  cat recover.tsv queue.tsv cand.tsv | awk -F'\t' 'NF >= 6 && !seen[$1]++' > all.tsv
   : > next.tsv
   while IFS=$'\t' read -r ID SHA ATT URL UPD CONC TITLE MODE; do
     [ -n "$ID" ] || continue
     [ -n "$CONC" ] || { echo "$ID" >> watch.txt; continue; }   # not finished yet
     [ -e "done/$ID.$ATT" ] && continue
     [ "$OLDJOBS" = 1 ] && grep -qx "$SHA" pending.txt 2>/dev/null && { touch "done/$ID.$ATT"; continue; }   # an old verdict job reports it
-    N=$(printf '%s' "$TITLE" | grep -oE '[0-9]+$' || echo 999999)
+    if [[ "$MODE" == remerge:* ]]; then
+      N=${MODE#remerge:}
+    else
+      N=$(printf '%s' "$TITLE" | grep -oE '[0-9]+$' || echo 999999)
+    fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$N" "$ID" "$SHA" "$ATT" "$URL" "$UPD" "$CONC" "$TITLE" "${MODE:-}" >> next.tsv
   done < all.tsv
   sort -t$'\t' -k1,1n -k2,2n next.tsv | cut -f2- > sorted.tsv

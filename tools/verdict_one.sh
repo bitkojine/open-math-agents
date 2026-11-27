@@ -4,6 +4,7 @@
 # Needs: GH_TOKEN REPO RUN_URL RUN_ID RUN_ATTEMPT HEAD_SHA [OMA_SITE]; the current directory holds artifact/ (the run's
 # verdict artifact) and base/ (main, with tools/ and data/).
 set -euo pipefail
+source "$(dirname "$0")/merge_recovery.sh"
 # Comments and labels go through REST: the GraphQL budget of GITHUB_TOKEN (about 1,000 points an hour for the whole
 # repository) is kept for the merge itself.
 comment() { gh api "repos/$REPO/issues/$PR/comments" -f body="$1" >/dev/null; }
@@ -87,6 +88,13 @@ if [ "$VERDICT" = "accepted" ]; then
 fi
 case "$VERDICT" in
   accepted)
+    if has_merge_label "$MERGE_HANDOFF_LABEL"; then
+      HANDOFF_STATUS=0
+      has_merge_handoff_for_head "$PR" "$HEAD_SHA" || HANDOFF_STATUS=$?
+      if [ "$HANDOFF_STATUS" = 0 ]; then exit 0; fi
+      if [ "$HANDOFF_STATUS" != 1 ]; then exit 1; fi
+      clear_merge_label "$PR" "$MERGE_HANDOFF_LABEL" || true
+    fi
     # Everything Lean accepts is merged and credited at once (no human gate). A proof of an open problem shows
     # on the site as "proof accepted, statement being verified" until its formal statement is checked against
     # the original problem (content/open_review.json); a statement merged here is checked the same way.
@@ -103,7 +111,7 @@ case "$VERDICT" in
       gh api -X DELETE "repos/$REPO/issues/$PR/labels/needs-human-review" >/dev/null 2>&1 || true
     fi
     {
-      if [ "${REMERGE:-0}" = 0 ]; then comment "$MSG"; fi   # a merge retry does not repeat the verdict
+      if [ "${REMERGE:-0}" = 0 ]; then comment "$MSG" || true; fi
       # Many verdicts merge at once: GitHub refuses a merge when main moved a moment before ("Base branch
       # was modified"). That is a race, not a rejection: retry with a random pause, a few times.
       MERGED=0
@@ -114,7 +122,8 @@ case "$VERDICT" in
       for TRY in 1 2 3 4 5 6 7 8; do
                 # REST first (its answer carries the merge commit and it spares the small GraphQL budget); when it answers
         # "Resource not accessible by integration", as it does for many of these pull requests, gh pr merge (GraphQL).
-        if OUT="$(gh api -X PUT "repos/$REPO/pulls/$PR/merge" -f merge_method=squash -f sha="$HEAD_SHA" 2>&1)"; then
+        if OUT="$(gh api -X PUT "repos/$REPO/pulls/$PR/merge" -f merge_method=squash -f sha="$HEAD_SHA" 2>&1)" \
+          && jq -e '.merged == true' <<< "$OUT" >/dev/null 2>&1; then
           MERGED=1; MERGE_SHA="$(printf '%s' "$OUT" | jq -r '.sha // empty' 2>/dev/null || true)"; break
         elif printf '%s' "$OUT" | grep -q "not accessible by integration" && OUT="$(gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$HEAD_SHA" 2>&1)"; then
           # the squash commit's sha from git (no API call; the REST answer can lag behind a GraphQL merge)
@@ -126,19 +135,43 @@ case "$VERDICT" in
         sleep $(( (RANDOM % 20) + 5 * TRY ))
       done
       if [ "$MERGED" = 1 ]; then
+        if has_merge_label "$MERGE_RETRY_LABEL"; then clear_merge_label "$PR" "$MERGE_RETRY_LABEL" || true; fi
         # A merge made with GITHUB_TOKEN triggers no other workflow, so credit it here.
         CREDIT_FILES=files.json CREDIT_PR=pr.json MERGE_SHA="${MERGE_SHA:-}" bash base/tools/credit.sh "$PR" || true
       elif [ "$MODE" = new ] && gh api "repos/$REPO/contents/$FPATH?ref=main" >/dev/null 2>&1; then
+        if has_merge_label "$MERGE_RETRY_LABEL"; then clear_merge_label "$PR" "$MERGE_RETRY_LABEL" || true; fi
         comment "Not merged: \`$FPATH\` is already on main (someone else's proof was merged first)."
-      elif [ "${REMERGE:-0}" -lt 6 ]; then
-        # a refused merge is retried by the merger a few minutes later (the check itself is not re-run)
-        touch remerge.flag
-        if [ "${REMERGE:-0}" = 0 ]; then comment "Accepted. GitHub refused the merge for now (${OUT:0:160}); the merge is retried automatically in a few minutes, nothing for you to do."; fi
       else
-        comment "Accepted, but GitHub kept refusing the merge (${OUT:0:200}). A maintainer will merge it; nothing for you to do."
+        # Set the local flag first in case GitHub is also refusing label writes.
+        touch remerge.flag
+        if ! has_merge_label "$MERGE_RETRY_LABEL" &&
+          ! add_merge_label "$PR" "$MERGE_RETRY_LABEL" "Accepted PR with an automatic merge retry pending"; then
+          touch merge-persistence-failed.flag
+        fi
+        if [ "${REMERGE:-0}" -ge 6 ]; then
+          # Write the checked SHA before adding the hold. Keep the retry when either write fails.
+          HANDOFF_STATUS=0
+          has_merge_handoff_for_head "$PR" "$HEAD_SHA" || HANDOFF_STATUS=$?
+          if [ "$HANDOFF_STATUS" = 1 ] && comment "GitHub kept refusing to merge the accepted revision \`$HEAD_SHA\`. Maintainer action is required.
+
+<!-- oma-merge-handoff $HEAD_SHA -->"; then HANDOFF_STATUS=0; fi
+          if [ "$HANDOFF_STATUS" = 0 ] && add_merge_label "$PR" "$MERGE_HANDOFF_LABEL" "Accepted PR awaiting maintainer merge action"; then
+            clear_merge_label "$PR" "$MERGE_RETRY_LABEL" || true
+            rm -f remerge.flag merge-persistence-failed.flag
+          fi
+        elif [ "${REMERGE:-0}" = 0 ]; then
+          if [ -e merge-persistence-failed.flag ]; then
+            comment "GitHub refused to merge the accepted revision \`$HEAD_SHA\` and the retry label could not be written. This runner will keep trying. If it stops, a maintainer should requeue this PR." || true
+          else
+            comment "Accepted. GitHub refused the merge for now (${OUT:0:160}). The merger will retry." || true
+          fi
+        fi
       fi
     } ;;
-  rejected) comment "**REJECTED**: $REASON. Push a fixed file to this pull request, or move on. [Run]($RUN_URL)" ;;
+  rejected)
+    if has_merge_label "$MERGE_RETRY_LABEL"; then clear_merge_label "$PR" "$MERGE_RETRY_LABEL" || true; fi
+    comment "**REJECTED**: $REASON. Push a fixed file to this pull request, or move on. [Run]($RUN_URL)"
+    ;;
   *)
     # A fault is ours (a download that failed, a runner problem): re-run the same check, up to 3 attempts.
     if [ "${RUN_ATTEMPT:-1}" -lt 3 ] && gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/rerun" >/dev/null; then
