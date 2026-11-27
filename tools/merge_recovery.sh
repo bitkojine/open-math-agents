@@ -21,26 +21,42 @@ add_merge_label() {
   gh api "$endpoint" -f "labels[]=$label" >/dev/null
 }
 
-clear_merge_retry() {
-  gh api -X DELETE "repos/$REPO/issues/$1/labels/$MERGE_RETRY_LABEL" >/dev/null
+clear_merge_label() {
+  gh api -X DELETE "repos/$REPO/issues/$1/labels/$2" >/dev/null
+}
+
+# Only the Actions bot's handoff for this exact revision can pause an accepted PR.
+has_merge_handoff_for_head() {
+  local pr="$1" sha="$2" comments
+  comments=$(gh api --paginate "repos/$REPO/issues/$pr/comments?per_page=100" \
+    --jq '.[] | select(.user.login == "github-actions[bot]") | .body') || return 2
+  grep -Fxq "<!-- oma-merge-handoff $sha -->" <<< "$comments"
 }
 
 discover_merge_retries() {
-  local run_fields="$1" prs pr details sha runs
+  local run_fields="$1" prs pr details sha title runs status
   prs=$(gh api --paginate "repos/$REPO/issues?state=open&labels=$MERGE_RETRY_LABEL&per_page=100" \
     --jq '.[] | select(.pull_request != null) | .number') || return 1
   while IFS= read -r pr; do
     [[ "$pr" =~ ^[0-9]+$ ]] || continue
     details=$(gh api "repos/$REPO/pulls/$pr") || continue
-    sha=$(jq -er --arg handoff "$MERGE_HANDOFF_LABEL" '
-      select(.state == "open" and .base.ref == "main")
-      | select(all(.labels[]?; .name != $handoff)) | .head.sha' <<< "$details") || continue
+    sha=$(jq -er 'select(.state == "open" and .base.ref == "main") | .head.sha' <<< "$details") || continue
     [[ "$sha" =~ ^[a-f0-9]{40}$ ]] || continue
+    if jq -e --arg label "$MERGE_HANDOFF_LABEL" 'any(.labels[]?; .name == $label)' <<< "$details" >/dev/null; then
+      status=0
+      has_merge_handoff_for_head "$pr" "$sha" || status=$?
+      [ "$status" = 1 ] || continue
+    fi
+    title=$(jq -r '.title // ""' <<< "$details") || continue
     runs=$(gh api "repos/$REPO/actions/workflows/check-proof.yml/runs?event=pull_request&head_sha=$sha&per_page=100") || continue
-    jq -r --arg sha "$sha" --arg title "check-proof #$pr" '
-      [.workflow_runs[] | select(.event == "pull_request" and .head_sha == $sha and .display_title == $title)]
+    jq -r --arg sha "$sha" --argjson pr "$pr" --arg title "$title" '
+      [.workflow_runs[] | select(.event == "pull_request" and .head_sha == $sha)
+        | select(.display_title == ("check-proof #" + ($pr | tostring))
+          or (((.display_title // "") | startswith("check-proof #") | not)
+            and (any(.pull_requests[]?; .number == $pr)
+              or ($title != "" and .display_title == $title))))]
       | max_by([.run_number, .run_attempt])
       | select(.status == "completed" and .conclusion == "success")
-      | ('"$run_fields"') + "\tremerge"' <<< "$runs"
+      | ('"$run_fields"') + "\tremerge:" + ($pr | tostring)' <<< "$runs"
   done <<< "$prs"
 }

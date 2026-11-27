@@ -123,8 +123,15 @@ verdict() {  # $1 run id, $2 head sha, $3 attempt, $4 url, $5 old (1/0), $6 slot
     echo "$ID" >> "$ROOT/watch.txt"; rm -f "$ROOT/done/$ID.$ATT"; return 0
   fi
   PR=$(head -c 12 "$W/artifact/pr.txt" 2>/dev/null | tr -cd '0-9'); [ -n "$PR" ] || return 0
+  if [[ "$MODE" == remerge:* ]]; then
+    # Older checks use the problem title. The artifact must tie the result to this PR.
+    if [ "$PR" != "${MODE#remerge:}" ] || ! jq -e '.verdict == "accepted"' "$W/artifact/verdict.json" >/dev/null; then
+      echo "merger: recovery candidate $ID has no accepted verdict for PR #${MODE#remerge:}" >&2
+      return 0
+    fi
+  fi
   local RM; RM=$(cat "$ROOT/remerge/$PR" 2>/dev/null || echo 0)
-  [ "$MODE" = remerge ] && [ "$RM" = 0 ] && RM=1               # requeued: accepted and reported before, merge again
+  if [[ "$MODE" == remerge || "$MODE" == remerge:* ]] && [ "$RM" = 0 ]; then RM=1; fi
   if [ "$OLD" = 1 ] && gh api "repos/$REPO/issues/$PR/comments?per_page=100" --jq '.[].body' 2>/dev/null | grep -qF "$URL"; then
     # already reported (by an earlier merger): a rejection stays reported; an accepted proof still open was not merged
     # (a refused merge whose retries were lost in a restart): merge it now without repeating the verdict
@@ -139,6 +146,9 @@ verdict() {  # $1 run id, $2 head sha, $3 attempt, $4 url, $5 old (1/0), $6 slot
     echo "$ID" >> "$ROOT/watch.txt"
   fi
   echo "#$PR run $ID.$ATT: exit $status $(grep -m1 -oiE 'rate limit|ACCEPTED|REJECTED|FAULT|already on main' "$W/log.txt" || true)"
+  if [ -e "$W/merge-persistence-failed.flag" ]; then
+    echo "::error title=Merge retry could not be persisted::PR #$PR did not merge and its retry label could not be written. Check the PR before this runner stops."
+  fi
   grep -qE 'REJECTED|already on main' "$W/log.txt" && echo "$PR" >> "$ROOT/rejected.txt"
   [ -e "$W/rerun.flag" ] && echo "$ID" >> "$ROOT/watch.txt"   # a fault re-runs the check: same run id, next attempt
   if [ -e "$W/remerge.flag" ]; then                               # merge refused: try the same verdict again later
@@ -200,7 +210,11 @@ while [ "$(date -u +%s)" -lt "$END" ]; do
     [ -n "$CONC" ] || { echo "$ID" >> watch.txt; continue; }   # not finished yet
     [ -e "done/$ID.$ATT" ] && continue
     [ "$OLDJOBS" = 1 ] && grep -qx "$SHA" pending.txt 2>/dev/null && { touch "done/$ID.$ATT"; continue; }   # an old verdict job reports it
-    N=$(printf '%s' "$TITLE" | grep -oE '[0-9]+$' || echo 999999)
+    if [[ "$MODE" == remerge:* ]]; then
+      N=${MODE#remerge:}
+    else
+      N=$(printf '%s' "$TITLE" | grep -oE '[0-9]+$' || echo 999999)
+    fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$N" "$ID" "$SHA" "$ATT" "$URL" "$UPD" "$CONC" "$TITLE" "${MODE:-}" >> next.tsv
   done < all.tsv
   sort -t$'\t' -k1,1n -k2,2n next.tsv | cut -f2- > sorted.tsv

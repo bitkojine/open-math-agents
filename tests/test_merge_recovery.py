@@ -39,7 +39,7 @@ def fail(message):
 
 def pr():
     return {"state": state["pr_state"], "base": {"ref": "main"}, "head": {"sha": state["sha"]},
-            "draft": False, "labels": [{"name": label} for label in state["labels"]]}
+            "draft": False, "title": state["title"], "labels": [{"name": label} for label in state["labels"]]}
 
 if endpoint == "pulls/42":
     reply(pr())
@@ -64,7 +64,23 @@ if endpoint == "pulls/42/merge":
     fail("Resource not accessible by integration (HTTP 403)")
 if args[:2] == ["pr", "merge"]:
     fail("Resource not accessible by integration (HTTP 403)")
+if args[:2] == ["run", "download"]:
+    destination = Path(args[args.index("-D") + 1])
+    destination.mkdir(parents=True)
+    (destination / "pr.txt").write_text(str(state["artifact_pr"]))
+    (destination / "verdict.json").write_text('{"verdict": "accepted"}')
+    sys.exit(0)
 if endpoint == "issues/42/comments":
+    if "-f" not in args:
+        for comment in state["comments"]:
+            if comment["bot"]:
+                print(comment["body"])
+        sys.exit(0)
+    if state["refuse_comments"]:
+        fail("HTTP 403")
+    body = next(arg.removeprefix("body=") for arg in args if arg.startswith("body="))
+    state["comments"].append({"bot": True, "body": body})
+    save()
     reply({})
 if endpoint == "issues/42/labels":
     label = next(arg.split("=", 1)[1] for arg in args if arg.startswith("labels[]="))
@@ -94,6 +110,10 @@ if endpoint == "actions/runs/11/jobs":
     sys.exit(0)
 if endpoint == "actions/workflows/check-proof.yml/runs":
     if "head_sha" not in query:
+        if state["recent_scan"] and query.get("status") == ["completed"]:
+            for run in state["runs"]:
+                print("\\t".join(str(run[k]) for k in
+                    ("id", "head_sha", "run_attempt", "html_url", "updated_at", "conclusion", "display_title")))
         sys.exit(0)  # The normal time-window scan cannot see the old run.
     assert query["event"] == ["pull_request"]
     assert query["head_sha"] == [state["sha"]]
@@ -110,6 +130,7 @@ class MergeRecovery(unittest.TestCase):
         self.state_path = self.tmp / "github.json"
         self.write(self.state_path, {
             "labels": [], "refuse_labels": [], "allow_merge": False, "superseded": False, "unconfirmed": False,
+            "comments": [], "refuse_comments": False, "title": "example-target", "artifact_pr": 42, "recent_scan": False,
             "merge_calls": 0, "pr_state": "open", "sha": SHA, "runs": [self.run_record()],
         })
         fake_gh = self.tmp / "gh"
@@ -143,11 +164,11 @@ class MergeRecovery(unittest.TestCase):
     def update(self, **changes):
         self.write(self.state_path, {**self.state(), **changes})
 
-    def bash(self, args, cwd, **changes):
+    def bash(self, args, cwd, include_stderr=False, **changes):
         result = subprocess.run(["bash", *args], cwd=cwd, env={**self.env, **changes},
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        return result.stdout
+        return result.stdout + (result.stderr if include_stderr else "")
 
     def job(self, runner):
         job = self.tmp / runner
@@ -189,7 +210,7 @@ class MergeRecovery(unittest.TestCase):
             path = self.tmp / command
             path.write_text("#!/usr/bin/env bash\n" + script + "\n")
             path.chmod(0o755)
-        return self.bash(["base/tools/merger_loop.sh"], job, GITHUB_RUN_ID="", MERGER_RESUME="",
+        return self.bash(["base/tools/merger_loop.sh"], job, include_stderr=True, GITHUB_RUN_ID="", MERGER_RESUME="",
                          MERGER_SECONDS="5", SLOTS="1", FIXTURE_CLOCK=str(clock))
 
     def test_403_is_discoverable_on_a_new_runner_and_can_merge(self):
@@ -199,7 +220,7 @@ class MergeRecovery(unittest.TestCase):
         recovered = self.discover().strip().split("\t")
         self.assertEqual(recovered, [
             "11", SHA, "1", self.env["RUN_URL"], "2000-01-01T12:00:00Z",
-            "success", "check-proof #42", "remerge",
+            "success", "check-proof #42", "remerge:42",
         ])
 
         self.update(allow_merge=True)
@@ -215,6 +236,40 @@ class MergeRecovery(unittest.TestCase):
         self.assertEqual(self.discover(), "")
         self.assertFalse(self.verdict("rescanned"))
         self.assertEqual(self.state()["merge_calls"], 2)
+
+    def test_a_new_accepted_head_clears_the_old_handoff(self):
+        self.assertTrue(self.verdict("first"))
+        self.assertFalse(self.verdict("exhausted", retry=6))
+        new_head = "b" * 40
+        self.update(sha=new_head, allow_merge=True)
+        self.env["HEAD_SHA"] = new_head
+        self.assertFalse(self.verdict("new-head"))
+        self.assertEqual(self.state()["pr_state"], "closed")
+        self.assertEqual(self.state()["labels"], [])
+
+    def test_label_write_failure_leaves_a_visible_handoff_comment(self):
+        self.update(refuse_labels=[PENDING])
+        self.assertTrue(self.verdict("first"))
+        self.assertEqual(self.state()["labels"], [])
+        self.assertTrue((self.tmp / "first/merge-persistence-failed.flag").exists())
+        self.assertTrue(any("a maintainer should requeue this PR" in c["body"]
+                            for c in self.state()["comments"]))
+
+    def test_when_label_and_comment_writes_fail_the_workflow_reports_the_retry(self):
+        self.update(refuse_labels=[PENDING], refuse_comments=True, recent_scan=True)
+        self.assertIn("::error title=Merge retry could not be persisted::PR #42", self.restart_merger())
+        self.assertEqual(self.state()["labels"], [])
+
+    def test_legacy_check_is_recovered_through_its_verdict_artifact(self):
+        self.update(labels=[PENDING], runs=[self.run_record(display_title="example-target")], allow_merge=True)
+        self.assertIn("#42 run 11.1: exit 0", self.restart_merger())
+        self.assertEqual(self.state()["pr_state"], "closed")
+
+    def test_legacy_artifact_for_another_pr_cannot_merge(self):
+        self.update(labels=[PENDING], runs=[self.run_record(display_title="example-target")], artifact_pr=43)
+        self.assertIn("has no accepted verdict for PR #42", self.restart_merger())
+        self.assertEqual(self.state()["merge_calls"], 0)
+        self.assertEqual(self.state()["labels"], [PENDING])
 
     def test_a_failed_handoff_write_preserves_recovery(self):
         self.assertTrue(self.verdict("first"))

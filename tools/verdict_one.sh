@@ -88,7 +88,13 @@ if [ "$VERDICT" = "accepted" ]; then
 fi
 case "$VERDICT" in
   accepted)
-    if has_merge_label "$MERGE_HANDOFF_LABEL"; then exit 0; fi
+    if has_merge_label "$MERGE_HANDOFF_LABEL"; then
+      HANDOFF_STATUS=0
+      has_merge_handoff_for_head "$PR" "$HEAD_SHA" || HANDOFF_STATUS=$?
+      if [ "$HANDOFF_STATUS" = 0 ]; then exit 0; fi
+      if [ "$HANDOFF_STATUS" != 1 ]; then exit 1; fi
+      clear_merge_label "$PR" "$MERGE_HANDOFF_LABEL" || true
+    fi
     # Everything Lean accepts is merged and credited at once (no human gate). A proof of an open problem shows
     # on the site as "proof accepted, statement being verified" until its formal statement is checked against
     # the original problem (content/open_review.json); a statement merged here is checked the same way.
@@ -105,7 +111,7 @@ case "$VERDICT" in
       gh api -X DELETE "repos/$REPO/issues/$PR/labels/needs-human-review" >/dev/null 2>&1 || true
     fi
     {
-      if [ "${REMERGE:-0}" = 0 ]; then comment "$MSG"; fi   # a merge retry does not repeat the verdict
+      if [ "${REMERGE:-0}" = 0 ]; then comment "$MSG" || true; fi
       # Many verdicts merge at once: GitHub refuses a merge when main moved a moment before ("Base branch
       # was modified"). That is a race, not a rejection: retry with a random pause, a few times.
       MERGED=0
@@ -129,32 +135,41 @@ case "$VERDICT" in
         sleep $(( (RANDOM % 20) + 5 * TRY ))
       done
       if [ "$MERGED" = 1 ]; then
-        if has_merge_label "$MERGE_RETRY_LABEL"; then clear_merge_retry "$PR" || true; fi
+        if has_merge_label "$MERGE_RETRY_LABEL"; then clear_merge_label "$PR" "$MERGE_RETRY_LABEL" || true; fi
         # A merge made with GITHUB_TOKEN triggers no other workflow, so credit it here.
         CREDIT_FILES=files.json CREDIT_PR=pr.json MERGE_SHA="${MERGE_SHA:-}" bash base/tools/credit.sh "$PR" || true
       elif [ "$MODE" = new ] && gh api "repos/$REPO/contents/$FPATH?ref=main" >/dev/null 2>&1; then
-        if has_merge_label "$MERGE_RETRY_LABEL"; then clear_merge_retry "$PR" || true; fi
+        if has_merge_label "$MERGE_RETRY_LABEL"; then clear_merge_label "$PR" "$MERGE_RETRY_LABEL" || true; fi
         comment "Not merged: \`$FPATH\` is already on main (someone else's proof was merged first)."
       else
         # Set the local flag first in case GitHub is also refusing label writes.
         touch remerge.flag
-        if ! has_merge_label "$MERGE_RETRY_LABEL"; then
-          add_merge_label "$PR" "$MERGE_RETRY_LABEL" "Accepted PR with an automatic merge retry pending" || true
+        if ! has_merge_label "$MERGE_RETRY_LABEL" &&
+          ! add_merge_label "$PR" "$MERGE_RETRY_LABEL" "Accepted PR with an automatic merge retry pending"; then
+          touch merge-persistence-failed.flag
         fi
         if [ "${REMERGE:-0}" -ge 6 ]; then
-          # Add the durable handoff before clearing the automatic retry.
-          if add_merge_label "$PR" "$MERGE_HANDOFF_LABEL" "Accepted PR awaiting maintainer merge action"; then
-            clear_merge_retry "$PR" || true
-            rm -f remerge.flag
-            comment "Accepted, but GitHub kept refusing the merge (${OUT:0:200}). This PR is marked for maintainer action."
+          # Write the checked SHA before adding the hold. Keep the retry when either write fails.
+          HANDOFF_STATUS=0
+          has_merge_handoff_for_head "$PR" "$HEAD_SHA" || HANDOFF_STATUS=$?
+          if [ "$HANDOFF_STATUS" = 1 ] && comment "GitHub kept refusing to merge the accepted revision \`$HEAD_SHA\`. Maintainer action is required.
+
+<!-- oma-merge-handoff $HEAD_SHA -->"; then HANDOFF_STATUS=0; fi
+          if [ "$HANDOFF_STATUS" = 0 ] && add_merge_label "$PR" "$MERGE_HANDOFF_LABEL" "Accepted PR awaiting maintainer merge action"; then
+            clear_merge_label "$PR" "$MERGE_RETRY_LABEL" || true
+            rm -f remerge.flag merge-persistence-failed.flag
           fi
         elif [ "${REMERGE:-0}" = 0 ]; then
-          comment "Accepted. GitHub refused the merge for now (${OUT:0:160}). The merger will retry."
+          if [ -e merge-persistence-failed.flag ]; then
+            comment "GitHub refused to merge the accepted revision \`$HEAD_SHA\` and the retry label could not be written. This runner will keep trying. If it stops, a maintainer should requeue this PR." || true
+          else
+            comment "Accepted. GitHub refused the merge for now (${OUT:0:160}). The merger will retry." || true
+          fi
         fi
       fi
     } ;;
   rejected)
-    if has_merge_label "$MERGE_RETRY_LABEL"; then clear_merge_retry "$PR" || true; fi
+    if has_merge_label "$MERGE_RETRY_LABEL"; then clear_merge_label "$PR" "$MERGE_RETRY_LABEL" || true; fi
     comment "**REJECTED**: $REASON. Push a fixed file to this pull request, or move on. [Run]($RUN_URL)"
     ;;
   *)
