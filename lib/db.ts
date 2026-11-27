@@ -65,7 +65,7 @@ async function tripColo(): Promise<void> {
     .catch(() => undefined);
 }
 
-async function rpc<T>(fn: string, args: Record<string, unknown>, timeoutMs = 4000, kind: "read" | "write" = "write"): Promise<T> {
+async function rpc<T>(fn: string, args: Record<string, unknown>, timeoutMs = 4000, kind: "read" | "required-read" | "write" = "write"): Promise<T> {
   const open = () => {
     const now = Date.now();
     return now < writesDownUntil || (kind === "read" && now < readsDownUntil);
@@ -89,7 +89,11 @@ async function rpc<T>(fn: string, args: Record<string, unknown>, timeoutMs = 400
     }
     return value;
   } catch (e) {
-    if (!(e instanceof DeskRefused)) {
+    if (!(e instanceof DeskRefused) && kind === "read" && !probing) {
+      // A page or crowd-count read has a shorter deadline and a fallback. It must not trip the write breaker.
+      readsDownUntil = Math.max(readsDownUntil, Date.now() + 120_000);
+      await tripColo();
+    } else if (!(e instanceof DeskRefused)) {
       failStreak = Math.min(failStreak + 1, 10);
       const pause = Math.min(30_000 * 2 ** (failStreak - 1), 300_000);
       readsDownUntil = Date.now() + Math.max(120_000, pause);
@@ -106,7 +110,7 @@ async function rpc<T>(fn: string, args: Record<string, unknown>, timeoutMs = 400
 
 async function rpcOnce<T>(fn: string, args: Record<string, unknown>, timeoutMs: number): Promise<T> {
   // Never let a slow database hang the site: page reads give up after 1 s (and fall back to the last good value),
-  // background refreshes after 3 s, writes after 8 s.
+  // background refreshes after 3 s, writes and required reads after 4 s.
   const res = await fetch(`${URL_}/rest/v1/rpc/oma_api`, {
     method: "POST",
     headers: { apikey: KEY!, "Content-Type": "application/json" },
@@ -422,12 +426,14 @@ export async function getSteps(parent?: string, fresh = false): Promise<Step[]> 
   return safe<Step[]>("steps", parent ? { parent } : {}, [], ttl);
 }
 
-/** The same read with no cache and no fallback: throws DeskUnavailable when the database cannot answer. For the
- * verdict route, which must never mistake a failed read for "this step does not exist" (that refused merged work). */
+/** Required step reads ignore the optional-read cooldown. Failures must not look like missing steps. */
 export const getStepsStrict = async (parent: string) => {
   if (!deskOnline) throw new DeskUnavailable();
-  return rpc<Step[]>("steps", { parent }, 4000, "read");
+  return rpc<Step[]>("steps", { parent }, 4000, "required-read");
 };
+
+/** The automatic picker can use cached scores and the slim list, but needs a real list or a retryable error. */
+export const getClaimableSteps = () => api<Step[]>("steps", {}, 60);
 
 export const logEvent = (kind: string, problem: string, handle: string, detail: string) =>
   api<{ ok?: boolean; error?: string }>("log", { kind, problem, handle, detail });

@@ -1,5 +1,5 @@
 import { PROBLEMS, getProblem, getFull, skeleton, proofPath, statementSkeleton, type Problem } from "@/lib/catalog";
-import { claim2, deskDown, deskOnline, getLiveMap, getStats, getSteps, hashIp, type Step } from "@/lib/db";
+import { claim2, deskDown, deskOnline, getClaimableSteps, getLiveMap, getStats, getSteps, getStepsStrict, hashIp } from "@/lib/db";
 import { json, clientIp, guarded } from "@/lib/desk";
 import { pointsFor } from "@/lib/points";
 import { STEP_RE, stepSkeleton } from "@/lib/steps";
@@ -81,10 +81,11 @@ async function handle(req: Request) {
   // Steps (hypotheses of accepted reductions) live in the database, not in the static catalogue.
   if (kind === "step" || STEP_RE.test(wanted)) {
     if (wanted && !force && pending.has(wanted)) return json(pendingError(wanted, pending.get(wanted)!, REPO), 409);
-    const steps = (await getSteps(undefined, true)).filter((s) => !s.solved && !solved.has(s.id) && (s.id === wanted || !pending.has(s.id)));
-    const picked: Step | null | undefined = wanted ? steps.find((x) => x.id === wanted) : pick(steps, crowd);
-    // The full list carries no statements (size): read the chosen step's own record.
-    const s: Step | null | undefined = picked ? ((await getSteps(picked.id, true)).find((x) => x.id === picked.id) ?? picked) : picked;
+    const steps = (await (wanted ? getStepsStrict(wanted) : getClaimableSteps()))
+      .filter((s) => !s.solved && !solved.has(s.id) && (s.id === wanted || !pending.has(s.id)));
+    const picked = wanted ? steps.find((step) => step.id === wanted) : pick(steps, crowd);
+    // The global list omits statements. Fetch the chosen record before issuing its proof skeleton.
+    const s = !wanted && picked ? (await getStepsStrict(picked.id)).find((step) => step.id === picked.id && !step.solved) : picked;
     if (!s) return json({ error: wanted ? "not_found_or_solved" : "nothing_matches", hint: "No open step right now. Try --kind known." }, 404);
     const r = await take(s.id, s.points);
     if (r.error) return json(r, r.error === "rate_limited" ? 429 : 409);
