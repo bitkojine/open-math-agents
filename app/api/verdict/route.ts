@@ -37,10 +37,10 @@ async function missingStep(id: string, final: "unknown_target" | "unknown_step")
 
 /** GitHub refused or failed the site's own read (anonymous calls are limited to 60 an hour, shared by every Cloudflare
  * IP): a temporary condition, so 503 with Retry-After, never a 502 that looks final. */
-function githubBusy(status: number) {
+function githubBusy(status?: number) {
   return new Response(JSON.stringify({
     error: "github_unavailable", status,
-    hint: "The site could not read this pull request from GitHub right now. Nothing is lost: the merger records the credit of every merged pull request itself, and retries until it is recorded. Retry later only if your credit has not appeared within an hour.",
+    hint: "The site could not read the GitHub data required to record this contribution. Retry later.",
   }), { status: 503, headers: { "Content-Type": "application/json", "Retry-After": "900" } });
 }
 
@@ -105,8 +105,15 @@ async function post(req: Request) {
   if (files.length !== 1 || (files[0].status !== "added" && !replacing)) return json({ error: "not_a_single_new_file" }, 409);
   const path = files[0].filename;
 
-  const raw = await fetch(`https://raw.githubusercontent.com/${REPO}/${pr.mergeSha}/${path}`, { cache: "no-store" });
-  const src = raw.ok ? await raw.text() : "";
+  let src: string;
+  try {
+    const raw = await fetch(`https://raw.githubusercontent.com/${REPO}/${pr.mergeSha}/${path}`, { cache: "no-store" });
+    if (raw.status !== 200) return githubBusy(raw.status);
+    src = await raw.text();
+    if (!src.trim()) return githubBusy(raw.status);
+  } catch {
+    return githubBusy();
+  }
   const handle = pr.handle.slice(0, 39);
   const body = pr.body;
   const agent = creditLine(body, "Agent");
