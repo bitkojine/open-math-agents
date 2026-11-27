@@ -87,17 +87,14 @@ if [ "$VERDICT" = "accepted" ]; then
 fi
 case "$VERDICT" in
   accepted)
-    # Everything Lean accepts is merged and credited at once (no human gate). A proof of an open problem shows
-    # on the site as "proof accepted, statement being verified" until its formal statement is checked against
-    # the original problem (content/open_review.json); a statement merged here is checked the same way.
     if [ "$MODE" = replace ]; then
-      MSG="**ACCEPTED: shorter proof** of \`$PID\` ($NEWLEN characters against $OLDLEN, comments and spaces not counted). Merged: it replaces the previous proof, and you are credited with the shortest proof of this problem (the first solve stays with whoever proved it first). [Run]($RUN_URL)"
+      MSG="**ACCEPTED: shorter proof** of \`$PID\` ($NEWLEN characters against $OLDLEN, comments and spaces not counted). [Run]($RUN_URL)"
     elif [ "$KIND" = "statement" ]; then
-      MSG="**ACCEPTED: the statement compiles.** Merged now: \`$PID\` becomes provable by everyone, and the formalization is credited to you. Its faithfulness to the source is checked separately; a statement found unfaithful is corrected and its proofs are labelled accordingly. [Run]($RUN_URL)"
+      MSG="**ACCEPTED: the statement compiles.** Its faithfulness to the source is checked separately. [Run]($RUN_URL)"
     elif [ "$KIND" = "open" ]; then
-      MSG="**ACCEPTED by the Lean checker** ($POL of \`$PID\`). Merged and credited now. On the site it shows as *proof accepted, statement being verified* until the formal statement is checked against the original problem (a mistranslated statement is the usual reason an open problem falls easily); then it counts as an open problem solved. [Run]($RUN_URL)"
+      MSG="**ACCEPTED by the Lean checker** ($POL of \`$PID\`). The formal statement is checked separately against the original problem. [Run]($RUN_URL)"
     else
-      MSG="**ACCEPTED** ($POL of \`$PID\`): ${REASON:-the Lean kernel accepted it and its axioms passed the audit}. Merged and credited. [Run]($RUN_URL)"
+      MSG="**ACCEPTED** ($POL of \`$PID\`): ${REASON:-the Lean kernel accepted it and its axioms passed the audit}. [Run]($RUN_URL)"
     fi
     if jq -e '.labels | map(.name) | index("needs-human-review")' pr.json >/dev/null; then
       gh api -X DELETE "repos/$REPO/issues/$PR/labels/needs-human-review" >/dev/null 2>&1 || true
@@ -114,7 +111,8 @@ case "$VERDICT" in
       for TRY in 1 2 3 4 5 6 7 8; do
                 # REST first (its answer carries the merge commit and it spares the small GraphQL budget); when it answers
         # "Resource not accessible by integration", as it does for many of these pull requests, gh pr merge (GraphQL).
-        if OUT="$(gh api -X PUT "repos/$REPO/pulls/$PR/merge" -f merge_method=squash -f sha="$HEAD_SHA" 2>&1)"; then
+        if OUT="$(gh api -X PUT "repos/$REPO/pulls/$PR/merge" -f merge_method=squash -f sha="$HEAD_SHA" 2>&1)" \
+          && jq -e '.merged == true' <<< "$OUT" >/dev/null 2>&1; then
           MERGED=1; MERGE_SHA="$(printf '%s' "$OUT" | jq -r '.sha // empty' 2>/dev/null || true)"; break
         elif printf '%s' "$OUT" | grep -q "not accessible by integration" && OUT="$(gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$HEAD_SHA" 2>&1)"; then
           # the squash commit's sha from git (no API call; the REST answer can lag behind a GraphQL merge)
@@ -128,6 +126,7 @@ case "$VERDICT" in
       if [ "$MERGED" = 1 ]; then
         # A merge made with GITHUB_TOKEN triggers no other workflow, so credit it here.
         CREDIT_FILES=files.json CREDIT_PR=pr.json MERGE_SHA="${MERGE_SHA:-}" bash base/tools/credit.sh "$PR" || true
+        comment "The pull request has been merged. [Run]($RUN_URL)"
       elif [ "$MODE" = new ] && gh api "repos/$REPO/contents/$FPATH?ref=main" >/dev/null 2>&1; then
         comment "Not merged: \`$FPATH\` is already on main (someone else's proof was merged first)."
       elif [ "${REMERGE:-0}" -lt 6 ]; then

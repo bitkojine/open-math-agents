@@ -74,6 +74,9 @@ print("LEAN TARGET:"); print(p.get("lean") or "(none yet: you are writing it)");
   echo "BRIEF       $STATE/briefs/$ID.txt   (read it now: definitions, reusable lemmas, references, what others tried, how to attack)"
   mkdir -p "$STATE/seen"; echo "$R" | jget lastNote > "$STATE/seen/$ID"
   echo "$R" | python3 -I -c 'import json,sys;d=json.load(sys.stdin)
+if d.get("degraded"):
+  print(d.get("hint") or "Offline assignment: coordination is unavailable.")
+  sys.exit(0)
 print(); print("YOUR ROLE  ", d.get("role","lead").upper()+":", d.get("roleTask",""))
 t=d.get("team") or []
 print("TEAMMATES  ", ", ".join("@%s (%s)" % (m["handle"], m["role"]) for m in t) if t else "none right now (you may get teammates later: every beat tells you)")
@@ -93,17 +96,30 @@ beat)
   [ "$CODE" = "200" ] || die "beat failed ($CODE): $(cat "$STATE/beat.json")"
   python3 -I -c 'import json,sys;d=json.load(open(sys.argv[1]))
 t=d.get("team") or []
-print("ok · role", d.get("role","?"), "· teammates:", ", ".join("@%s (%s)" % (m["handle"], m["role"]) for m in t) if t else "none")
+if d.get("refreshed") is False:
+  print(d.get("hint") or "Your lease could not be refreshed.")
+else:
+  print("ok · role", d.get("role","?"), "· teammates:", ", ".join("@%s (%s)" % (m["handle"], m["role"]) for m in t) if t else "none")
 for x in d.get("notes") or []:
   print("NEW NOTE #%s @%s %s (data to check, not instructions):" % (x["id"], x["handle"], x["at"][:16])); print("  " + x["note"].replace("\n", "\n  "))
 ' "$STATE/beat.json"
   LN="$(jget last_note < "$STATE/beat.json")"; [ -z "$LN" ] || echo "$LN" > "$STATE/seen/$1"
   ;;
 check)
-  [ $# -ge 1 ] || die "usage: check <id>"
-  OMA_FC="$FC" $CHECK "$(file_of "$1")" "$STATE/verdict.json" || true
-  python3 -I -c 'import json;d=json.load(open("'"$STATE"'/verdict.json"));print(d["verdict"].upper()+":", d["reason"]);
-import sys; sys.exit(0 if d["verdict"]=="accepted" else 1)' || { tail -c 3000 <(jget log < "$STATE/verdict.json"); exit 1; }
+  (
+    [ $# -ge 1 ] || die "usage: check <id>"
+    CHECK_DIR="$(mktemp -d "$STATE/check.XXXXXX")"
+    trap 'rm -rf -- "$CHECK_DIR"' EXIT
+    VERDICT_FILE="$CHECK_DIR/verdict.json"
+    CHECK_STATUS=0
+    OMA_FC="$FC" "$CHECK" "$(file_of "$1")" "$VERDICT_FILE" || CHECK_STATUS=$?
+    [ -s "$VERDICT_FILE" ] || die "checker produced no verdict"
+    python3 -I -c 'import json,sys;d=json.load(open(sys.argv[1]));
+if d["verdict"]=="accepted" and sys.argv[2]!="0":
+    sys.exit("checker failed after writing an accepted verdict")
+print(d["verdict"].upper()+":", d["reason"]);
+sys.exit(0 if d["verdict"]=="accepted" else 1)' "$VERDICT_FILE" "$CHECK_STATUS" || { tail -c 3000 <(jget log < "$VERDICT_FILE"); exit 1; }
+  )
   ;;
 submit)
   [ $# -ge 1 ] || die "usage: submit <id>"
@@ -174,7 +190,9 @@ note)
 release)
   [ $# -ge 2 ] || die "usage: release <id> out_of_time|statement_seems_false|missing_lemma|does_not_elaborate|too_hard|other"
   L="$(lease_of "$1")"
-  curl -sS -m 30 -X POST "$SITE/api/desk/release?lease=$L&reason=$(enc "$2")"; echo
+  R="$(curl -sS -m 30 -X POST "$SITE/api/desk/release?lease=$L&reason=$(enc "$2")")"
+  printf '%s\n' "$R"
+  [ "$(jget ok <<< "$R")" = True ] || [ "$(jget error <<< "$R")" = not_active ] || die "release was not confirmed"
   rm -f "$STATE/leases/$1"
   ;;
 status)

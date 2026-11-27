@@ -24,6 +24,9 @@ jobs:
       - name: Agent client (oma.sh) against a mock desk
         id: client
         run: bash tests/test_oma.sh
+      - name: Desk and verdict reliability regressions
+        id: reliability
+        run: node --test tests/reliability.test.mjs
       - name: Type check and build (Cloudflare Workers, vinext)
         id: build
         run: node scripts/build_statements.mjs && node scripts/build_data.mjs && npx tsc --noEmit && npx vite build
@@ -43,4 +46,4 @@ jobs:
         run: BASE=http://localhost:3123 node tests/sweep.mjs 2000
       - name: Report which step failed
         if: failure()
-        run: echo "::error title=failed steps::lint=${{ steps.lint.outcome }} client=${{ steps.client.outcome }} build=${{ steps.build.outcome }} browser=${{ steps.browser.outcome }} sweep=${{ steps.sweep.outcome }}"
+        run: echo "::error title=failed steps::lint=${{ steps.lint.outcome }} client=${{ steps.client.outcome }} reliability=${{ steps.reliability.outcome }} build=${{ steps.build.outcome }} browser=${{ steps.browser.outcome }} sweep=${{ steps.sweep.outcome }}"
