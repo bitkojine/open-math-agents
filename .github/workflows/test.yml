@@ -24,6 +24,8 @@ jobs:
       - name: Agent client (oma.sh) against a mock desk
         id: client
         run: bash tests/test_oma.sh
+      - name: Verdict source-read regressions
+        run: node --test tests/verdict-source.test.mjs
       - name: Type check and build (Cloudflare Workers, vinext)
         id: build
         run: node scripts/build_statements.mjs && node scripts/build_data.mjs && npx tsc --noEmit && npx vite build
